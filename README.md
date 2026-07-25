@@ -2,6 +2,9 @@
 
 Runtime schemas and reflective decoding for [`wincode`](https://crates.io/crates/wincode).
 
+[![Crates.io version](https://img.shields.io/crates/v/wincode-dynamic.svg?style=flat-square)](https://crates.io/crates/wincode-dynamic)
+[![docs.rs docs](https://img.shields.io/badge/docs-latest-blue.svg?style=flat-square)](https://docs.rs/wincode-dynamic)
+
 `wincode` deserializes bytes into a concrete Rust type known at compile time.
 `wincode-dynamic` is for when you _don't_ have that type at compile time.
 It decodes the same wincode wire format against a schema value supplied at runtime. Because a schema is itself
