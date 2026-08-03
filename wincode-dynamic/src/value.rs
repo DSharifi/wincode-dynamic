@@ -15,7 +15,7 @@ use {
 };
 
 /// An owned, dynamically typed primitive value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
 pub enum PrimitiveValue {
     /// An unsigned 8-bit integer.
     U8(u8),
