@@ -22,7 +22,7 @@ std = ["wincode/std"]
 derive = ["dep:wincode-dynamic-derive"]
 
 [dependencies]
-wincode = { version = "0.5.5", features = ["alloc", "derive"], default-features = false }
+wincode = { version = "0.6.1", features = ["alloc", "derive"], default-features = false }
 wincode-dynamic-derive = { path = "../wincode-dynamic-derive", optional = true, version = "0.1.0" }
 
 [dev-dependencies]
