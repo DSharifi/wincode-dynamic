@@ -258,6 +258,18 @@ pub trait SchemaDynamic {
     fn schema() -> RootSchema;
 }
 
+impl<T> SchemaDynamic for &T
+where
+    T: SchemaDynamic + ?Sized,
+{
+    const SERIALIZED_SIZE: SerializedSize = T::SERIALIZED_SIZE;
+
+    #[inline]
+    fn schema() -> RootSchema {
+        T::schema()
+    }
+}
+
 /// Decodes a wincode-encoded payload reflectively using a runtime
 /// [`RootSchema`].
 ///
@@ -585,6 +597,31 @@ mod test {
                 .unwrap()
                 .len(),
             5
+        );
+    }
+
+    #[test]
+    fn shared_references_forward_dynamic_schema() {
+        fn schema_for<T>(_: T) -> RootSchema
+        where
+            T: SchemaDynamic + SchemaWrite<wincode::config::DefaultConfig, Src = T>,
+        {
+            T::schema()
+        }
+
+        let message = FixedSizeMessage {
+            value: 42,
+            enabled: true,
+        };
+        let RootSchema::Struct(schema) = schema_for(&message) else {
+            panic!("expected a struct schema");
+        };
+
+        assert_eq!(schema.name(), "FixedSizeMessage");
+        assert_eq!(schema.size(), Some(9));
+        assert_eq!(
+            <&FixedSizeMessage as SchemaDynamic>::SERIALIZED_SIZE,
+            FixedSizeMessage::SERIALIZED_SIZE,
         );
     }
 
