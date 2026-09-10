@@ -29,7 +29,7 @@ pub struct FieldDef {
     size: Option<usize>,
 }
 
-/// A decoded field yielded by [`Decoder::fields`].
+/// A decoded field yielded by [`ValueDecoder::fields`].
 ///
 /// The field borrows its metadata from the decoder's schema and its value from
 /// the encoded input data.
@@ -258,12 +258,59 @@ pub trait SchemaDynamic {
     fn schema() -> RootSchema;
 }
 
+/// A payload's selected schema and reader, returned by [`Decoder::decode`].
+///
+/// For an enum, the variant tag has already been read. Inspecting the variant
+/// name consumes no input. Fields are decoded lazily by
+/// [`ValueDecoder::fields`].
+#[derive(Debug)]
+pub struct ValueDecoder<'schema, R> {
+    schema: &'schema Schema,
+    variant_name: Option<&'schema str>,
+    reader: R,
+}
+
+impl<'schema, R> ValueDecoder<'schema, R> {
+    /// Returns the selected variant's name for an enum, or [`None`] for a
+    /// struct.
+    #[inline]
+    pub const fn variant_name(&self) -> Option<&'schema str> {
+        self.variant_name
+    }
+
+    /// Consumes this value decoder and returns a lazy iterator over its fields.
+    ///
+    /// Fields are decoded in schema order as the iterator advances, starting
+    /// after the variant tag for enums. Field decoding errors are returned by
+    /// the corresponding iterator item.
+    #[inline]
+    pub fn fields<'de>(self) -> impl Iterator<Item = ReadResult<Field<'schema, 'de>>>
+    where
+        R: Reader<'de>,
+    {
+        let Self {
+            schema, mut reader, ..
+        } = self;
+
+        schema.fields.iter().map(move |field| {
+            let value = field.parse(reader.by_ref())?;
+            Ok(Field {
+                name: &field.name,
+                ty: field.ty,
+                size: field.size,
+                value,
+            })
+        })
+    }
+}
+
 /// Decodes a wincode-encoded payload reflectively using a runtime
 /// [`RootSchema`].
 ///
 /// A decoder only needs to be created once for a given [`RootSchema`] and can
 /// then be reused for every value encoded with that schema. Call
-/// [`Decoder::fields`] to iterate over a value's decoded fields.
+/// [`Decoder::decode`] to select a value's variant and then
+/// [`ValueDecoder::fields`] to iterate over its decoded fields.
 #[derive(Debug)]
 pub struct Decoder {
     schema: RootSchema,
@@ -284,6 +331,12 @@ impl Decoder {
         }
     }
 
+    /// Returns whether this decoder's root schema is an enum.
+    #[inline]
+    pub const fn is_enum(&self) -> bool {
+        matches!(&self.schema, RootSchema::Enum { .. })
+    }
+
     /// Returns the complete encoded size of a root value when it is fixed.
     ///
     /// For enums, this includes the variant tag. The size uses wincode's
@@ -296,16 +349,18 @@ impl Decoder {
         }
     }
 
-    /// Returns a lazy iterator over the fields in an encoded payload.
+    /// Prepares a payload for inspecting its variant name and decoding its
+    /// fields.
     ///
-    /// Fields are decoded in schema order as the iterator advances. For an
-    /// enum, this method first reads the variant tag and then iterates over
-    /// that variant's fields.
+    /// For an enum, reads the variant tag once and selects that variant's
+    /// schema. For a struct, consumes no input. Call [`ValueDecoder::fields`]
+    /// to decode the fields lazily.
     ///
     /// # Errors
     ///
-    /// Returns an error if an enum variant tag is invalid. Errors encountered
-    /// while decoding a field are returned by the corresponding iterator item.
+    /// Returns an error if an enum variant tag cannot be read or is invalid.
+    /// Errors encountered while decoding a field are returned by the
+    /// corresponding iterator item.
     ///
     /// # Examples
     ///
@@ -328,7 +383,7 @@ impl Decoder {
     ///
     /// let schema = wincode::deserialize::<RootSchema>(&encoded_schema)?;
     /// let decoder = Decoder::new(schema);
-    /// let mut fields = decoder.fields(&encoded_value[..])?;
+    /// let mut fields = decoder.decode(&encoded_value[..])?.fields();
     ///
     /// let id = fields.next().expect("id field")?;
     /// assert_eq!(id.name(), "id");
@@ -343,12 +398,12 @@ impl Decoder {
     /// # }
     /// ```
     #[inline]
-    pub fn fields<'a, 'de>(
-        &'a self,
-        mut reader: impl Reader<'de> + 'a,
-    ) -> ReadResult<impl Iterator<Item = ReadResult<Field<'a, 'de>>> + 'a> {
-        let fields = match &self.schema {
-            RootSchema::Struct(schema) => &schema.fields,
+    pub fn decode<'schema, 'de, R: Reader<'de>>(
+        &'schema self,
+        mut reader: R,
+    ) -> ReadResult<ValueDecoder<'schema, R>> {
+        let (schema, variant_name) = match &self.schema {
+            RootSchema::Struct(schema) => (schema, None),
             RootSchema::Enum {
                 variants,
                 tag_encoding,
@@ -356,22 +411,18 @@ impl Decoder {
             } => {
                 let disc = tag_encoding.parse_into_usize(reader.by_ref())?;
 
-                &variants
+                let schema = variants
                     .get(disc)
-                    .ok_or_else(|| invalid_tag_encoding(disc))?
-                    .fields
+                    .ok_or_else(|| invalid_tag_encoding(disc))?;
+                (schema, Some(schema.name()))
             }
         };
 
-        Ok(fields.iter().map(move |field| {
-            let value = field.parse(reader.by_ref())?;
-            Ok(Field {
-                name: &field.name,
-                ty: field.ty,
-                size: field.size,
-                value,
-            })
-        }))
+        Ok(ValueDecoder {
+            schema,
+            variant_name,
+            reader,
+        })
     }
 }
 
@@ -495,14 +546,13 @@ mod test {
     fn assert_enum_message(
         decoder: &Decoder,
         message: &EnumMessage,
+        variant: &str,
         expected: Vec<(&str, Ty, Option<usize>, Value<'_>)>,
     ) {
         let payload = wincode::serialize(message).unwrap();
-        let actual = decoder
-            .fields(payload.as_slice())
-            .unwrap()
-            .collect::<ReadResult<Vec<_>>>()
-            .unwrap();
+        let value = decoder.decode(payload.as_slice()).unwrap();
+        assert_eq!(value.variant_name(), Some(variant));
+        let actual = value.fields().collect::<ReadResult<Vec<_>>>().unwrap();
         assert_eq!(actual.len(), expected.len());
         for (actual, (name, ty, size, value)) in actual.iter().zip(expected.iter()) {
             assert_field(actual, name, *ty, *size, value);
@@ -520,6 +570,54 @@ mod test {
         assert_eq!(field.ty(), ty);
         assert_eq!(field.size(), size);
         assert_eq!(field.value(), value);
+    }
+
+    #[test]
+    fn struct_decode_consumes_no_input() {
+        let decoder = Decoder::new(FixedSizeMessage::schema());
+        let mut reader = &[][..];
+        let value = decoder.decode(&mut reader).unwrap();
+        assert!(!decoder.is_enum());
+        assert_eq!(value.variant_name(), None);
+        // Even missing fields are only reported when iterating.
+        assert!(value.fields().next().unwrap().is_err());
+    }
+
+    #[test]
+    fn enum_values_share_a_reader_without_rereading_tags() {
+        use wincode::io::Cursor;
+
+        fn check_stream<'de>(decoder: &Decoder, mut reader: impl Reader<'de>) {
+            let value = decoder.decode(reader.by_ref()).unwrap();
+            let variant_name = value.variant_name();
+            assert_eq!(variant_name, Some("Coordinates"));
+            assert_eq!(value.variant_name(), variant_name);
+            let fields = value.fields().collect::<ReadResult<Vec<_>>>().unwrap();
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].value(), &Value::U64(42));
+            assert_eq!(fields[1].value(), &Value::Bool(true));
+
+            let value = decoder.decode(reader.by_ref()).unwrap();
+            assert_eq!(value.variant_name(), Some("Ping"));
+            assert_eq!(value.fields().count(), 0);
+            // A saved name belongs to the schema, not the consumed value decoder.
+            assert_eq!(variant_name, Some("Coordinates"));
+        }
+
+        let decoder = Decoder::new(EnumMessage::schema());
+        let mut payload = Vec::new();
+        for message in [EnumMessage::Coordinates(42, true), EnumMessage::Ping] {
+            payload.extend(wincode::serialize(&message).unwrap());
+        }
+
+        let mut reader = payload.as_slice();
+        check_stream(&decoder, &mut reader);
+        assert!(reader.is_empty());
+
+        let payload_len = payload.len();
+        let mut reader = Cursor::new(payload);
+        check_stream(&decoder, &mut reader);
+        assert_eq!(reader.position(), payload_len);
     }
 
     #[test]
@@ -598,8 +696,9 @@ mod test {
         let payload = wincode::serialize(&opaque).unwrap();
         let decoder = Decoder::new(OpaqueSkippedField::schema());
         let fields = decoder
-            .fields(payload.as_slice())
+            .decode(payload.as_slice())
             .unwrap()
+            .fields()
             .collect::<ReadResult<Vec<_>>>()
             .unwrap();
         assert_eq!(fields.len(), 1);
@@ -619,8 +718,9 @@ mod test {
         let payload = wincode::serialize(&message).unwrap();
         let decoder = Decoder::new(SkippedFieldStruct::schema());
         let fields = decoder
-            .fields(payload.as_slice())
+            .decode(payload.as_slice())
             .unwrap()
+            .fields()
             .collect::<ReadResult<Vec<_>>>()
             .unwrap();
         assert_eq!(fields.len(), 2);
@@ -643,8 +743,9 @@ mod test {
         let payload = wincode::serialize(&message).unwrap();
         let decoder = Decoder::new(SkippedFieldEnum::schema());
         let fields = decoder
-            .fields(payload.as_slice())
+            .decode(payload.as_slice())
             .unwrap()
+            .fields()
             .collect::<ReadResult<Vec<_>>>()
             .unwrap();
         assert_eq!(fields.len(), 1);
@@ -674,8 +775,9 @@ mod test {
 
         let payload = wincode::serialize(&message).unwrap();
         let result = decoder
-            .fields(&payload[..])
+            .decode(&payload[..])
             .unwrap()
+            .fields()
             .collect::<ReadResult<Vec<_>>>()
             .unwrap();
         let mut result = result.into_iter();
@@ -799,8 +901,9 @@ mod test {
 
         let decoder = Decoder::new(Bools::schema());
         let value = decoder
-            .fields(payload.as_slice())
+            .decode(payload.as_slice())
             .unwrap()
+            .fields()
             .next()
             .unwrap()
             .unwrap();
@@ -870,7 +973,13 @@ mod test {
         let payload = &storage[offset..offset + payload.len()];
 
         let decoder = Decoder::new(Message::schema());
-        let field = decoder.fields(payload).unwrap().next().unwrap().unwrap();
+        let field = decoder
+            .decode(payload)
+            .unwrap()
+            .fields()
+            .next()
+            .unwrap()
+            .unwrap();
         let Value::Vec(values) = field.value() else {
             panic!("expected a lazy vector");
         };
@@ -987,16 +1096,17 @@ mod test {
         assert_eq!(tag_encoding, PrimitiveTy::U8);
 
         let decoder = Decoder::new(U8EnumMessage::schema());
+        assert!(decoder.is_enum());
 
         let ping = wincode::serialize(&U8EnumMessage::Ping).unwrap();
-        assert_eq!(decoder.fields(ping.as_slice()).unwrap().count(), 0);
+        let ping = decoder.decode(ping.as_slice()).unwrap();
+        assert_eq!(ping.variant_name(), Some("Ping"));
+        assert_eq!(ping.fields().count(), 0);
 
-        let value = wincode::serialize(&U8EnumMessage::Value(42)).unwrap();
-        let fields = decoder
-            .fields(value.as_slice())
-            .unwrap()
-            .collect::<ReadResult<Vec<_>>>()
-            .unwrap();
+        let payload = wincode::serialize(&U8EnumMessage::Value(42)).unwrap();
+        let value = decoder.decode(payload.as_slice()).unwrap();
+        assert_eq!(value.variant_name(), Some("Value"));
+        let fields = value.fields().collect::<ReadResult<Vec<_>>>().unwrap();
         assert_eq!(fields.len(), 1);
         assert_field(
             &fields[0],
@@ -1011,10 +1121,11 @@ mod test {
     fn enum_roundtrips_every_variant_shape() {
         let decoder = Decoder::new(EnumMessage::schema());
 
-        assert_enum_message(&decoder, &EnumMessage::Ping, Vec::new());
+        assert_enum_message(&decoder, &EnumMessage::Ping, "Ping", Vec::new());
         assert_enum_message(
             &decoder,
             &EnumMessage::Coordinates(42, true),
+            "Coordinates",
             vec![
                 (
                     "0",
@@ -1036,6 +1147,7 @@ mod test {
                 text: "hello".into(),
                 bytes: vec![1, 2, 3, 4],
             },
+            "Payload",
             vec![
                 (
                     "text",
@@ -1058,7 +1170,7 @@ mod test {
         let decoder = Decoder::new(EnumMessage::schema());
         let payload = wincode::serialize(&u32::MAX).unwrap();
 
-        let error = match decoder.fields(payload.as_slice()) {
+        let error = match decoder.decode(payload.as_slice()) {
             Ok(_) => panic!("invalid discriminant unexpectedly parsed"),
             Err(error) => error,
         };
@@ -1074,22 +1186,20 @@ mod test {
         let decoder = Decoder::new(EnumMessage::schema());
 
         let truncated_discriminant = [0u8; 3];
-        assert!(decoder.fields(&truncated_discriminant[..]).is_err());
+        assert!(decoder.decode(&truncated_discriminant[..]).is_err());
 
         let mut truncated = wincode::serialize(&EnumMessage::Coordinates(42, true)).unwrap();
         truncated.pop();
-        let truncated_result = decoder
-            .fields(truncated.as_slice())
-            .unwrap()
-            .collect::<ReadResult<Vec<_>>>();
+        let value = decoder.decode(truncated.as_slice()).unwrap();
+        assert_eq!(value.variant_name(), Some("Coordinates"));
+        let truncated_result = value.fields().collect::<ReadResult<Vec<_>>>();
         assert!(truncated_result.is_err());
 
         let mut malformed = wincode::serialize(&EnumMessage::Coordinates(42, true)).unwrap();
         *malformed.last_mut().unwrap() = 2;
-        let malformed_result = decoder
-            .fields(malformed.as_slice())
-            .unwrap()
-            .collect::<ReadResult<Vec<_>>>();
+        let value = decoder.decode(malformed.as_slice()).unwrap();
+        assert_eq!(value.variant_name(), Some("Coordinates"));
+        let malformed_result = value.fields().collect::<ReadResult<Vec<_>>>();
         assert!(matches!(
             malformed_result,
             Err(wincode::ReadError::InvalidBoolEncoding(2))
@@ -1112,8 +1222,9 @@ mod test {
         let payload = wincode::serialize(&value).unwrap();
         let decoder = Decoder::new(Borrowable::schema());
         let fields = decoder
-            .fields(payload.as_slice())
+            .decode(payload.as_slice())
             .unwrap()
+            .fields()
             .collect::<ReadResult<Vec<_>>>()
             .unwrap();
 
@@ -1147,7 +1258,7 @@ mod test {
         })
         .unwrap();
         let decoder = Decoder::new(Owned::schema());
-        let mut fields = decoder.fields(Cursor::new(payload)).unwrap();
+        let mut fields = decoder.decode(Cursor::new(payload)).unwrap().fields();
 
         let text = fields.next().unwrap().unwrap().into_value();
         assert!(matches!(
@@ -1265,8 +1376,9 @@ mod test {
         let decoder = Decoder::new(Generic::<u64>::schema());
         let payload = wincode::serialize(&Generic::Item(77u64)).unwrap();
         let fields = decoder
-            .fields(payload.as_slice())
+            .decode(payload.as_slice())
             .unwrap()
+            .fields()
             .collect::<ReadResult<Vec<_>>>()
             .unwrap();
 
@@ -1280,7 +1392,14 @@ mod test {
         );
 
         let empty_payload = wincode::serialize(&Generic::<u64>::Empty).unwrap();
-        assert_eq!(decoder.fields(empty_payload.as_slice()).unwrap().count(), 0);
+        assert_eq!(
+            decoder
+                .decode(empty_payload.as_slice())
+                .unwrap()
+                .fields()
+                .count(),
+            0
+        );
     }
 
     proptest! {
@@ -1291,8 +1410,9 @@ mod test {
             let payload = wincode::serialize(&message).unwrap();
             let decoder = Decoder::new(StructMessage::schema());
             let fields = decoder
-                .fields(payload.as_slice())
+                .decode(payload.as_slice())
                 .unwrap()
+                .fields()
                 .collect::<ReadResult<Vec<_>>>()
                 .unwrap();
             let mut fields = fields.into_iter().map(|field| field.value);
@@ -1344,8 +1464,9 @@ mod test {
             let payload = wincode::serialize(&message).unwrap();
             let decoder = Decoder::new(EnumMessage::schema());
             let actual = decoder
-                .fields(payload.as_slice())
+                .decode(payload.as_slice())
                 .unwrap()
+                .fields()
                 .collect::<ReadResult<Vec<_>>>()
                 .unwrap()
                 .into_iter()
@@ -1374,8 +1495,8 @@ mod test {
 
             let decoder = Decoder::new(StructMessage::schema());
             let result = decoder
-                .fields(payload.as_slice())
-                .and_then(|fields| fields.collect::<ReadResult<Vec<_>>>());
+                .decode(payload.as_slice())
+                .and_then(|value| value.fields().collect::<ReadResult<Vec<_>>>());
             prop_assert!(result.is_err());
         }
     }
@@ -1399,8 +1520,9 @@ mod test {
                     let payload = wincode::serialize(&message).unwrap();
                     let decoder = Decoder::new(Message::schema());
                     let value = decoder
-                        .fields(payload.as_slice())
+                        .decode(payload.as_slice())
                         .unwrap()
+                        .fields()
                         .next()
                         .unwrap()
                         .unwrap();

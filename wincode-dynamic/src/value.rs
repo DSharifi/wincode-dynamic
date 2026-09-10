@@ -229,7 +229,7 @@ pub mod lazy_vec {
         /// })
         /// .expect("serialize message");
         /// let decoder = Decoder::new(Message::schema());
-        /// let mut fields = decoder.fields(encoded.as_slice())?;
+        /// let mut fields = decoder.decode(encoded.as_slice())?.fields();
         ///
         /// let field = fields.next().expect("values field")?;
         /// assert_eq!(field.name(), "values");
