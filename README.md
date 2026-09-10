@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let decoder = Decoder::new(wincode::deserialize::<RootSchema>(&schema)?);
 
     // ...and reflect over every record that follows.
-    for field in decoder.fields(&record[..])? {
+    for field in decoder.decode(&record[..])?.fields() {
         let field = field?;
         println!("{} = {:?}", field.name(), field.value());
     }
