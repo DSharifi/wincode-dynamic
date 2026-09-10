@@ -258,6 +258,24 @@ pub trait SchemaDynamic {
     fn schema() -> RootSchema;
 }
 
+/// A decoded value's names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodedName<'a> {
+    /// The struct type's name.
+    Struct(&'a str),
+    /// The enum type's name and the selected variant's name.
+    Enum(EnumName<'a>),
+}
+
+/// The names identifying an enum value
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumName<'a> {
+    /// The enum type's name.
+    pub enum_name: &'a str,
+    /// The selected variant's name.
+    pub variant_name: &'a str,
+}
+
 /// Decodes a wincode-encoded payload reflectively using a runtime
 /// [`RootSchema`].
 ///
@@ -293,6 +311,55 @@ impl Decoder {
         match &self.schema {
             RootSchema::Struct(schema) => schema.size,
             RootSchema::Enum { size, .. } => *size,
+        }
+    }
+
+    /// Returns the struct name or enum and variant names for an encoded
+    /// payload.
+    ///
+    /// This method expects a reader at the start of the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the enum variant tag cannot be read or is invalid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use wincode::{SchemaRead, SchemaWrite};
+    /// use wincode_dynamic::{DecodedName, Decoder, EnumName, SchemaDynamic, Value};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// #[derive(SchemaDynamic, SchemaRead, SchemaWrite)]
+    /// enum Message {
+    ///     Ping,
+    ///     Count(u64),
+    /// }
+    ///
+    /// let decoder = Decoder::new(Message::schema());
+    /// let payload = wincode::serialize(&Message::Count(42))?;
+    /// assert_eq!(
+    ///     decoder.decoded_name(payload.as_slice())?,
+    ///     DecodedName::Enum(EnumName {
+    ///         enum_name: "Message",
+    ///         variant_name: "Count",
+    ///     }),
+    /// );
+    ///
+    /// let mut fields = decoder.fields(payload.as_slice())?;
+    /// assert_eq!(fields.next().unwrap()?.value(), &Value::U64(42));
+    /// assert!(fields.next().is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn decoded_name<'de>(&self, reader: impl Reader<'de>) -> ReadResult<DecodedName<'_>> {
+        match &self.schema {
+            RootSchema::Struct(schema) => Ok(DecodedName::Struct(schema.name())),
+            RootSchema::Enum { name, .. } => Ok(DecodedName::Enum(EnumName {
+                enum_name: name,
+                variant_name: self.read_schema(reader)?.name(),
+            })),
         }
     }
 
@@ -347,21 +414,7 @@ impl Decoder {
         &'a self,
         mut reader: impl Reader<'de> + 'a,
     ) -> ReadResult<impl Iterator<Item = ReadResult<Field<'a, 'de>>> + 'a> {
-        let fields = match &self.schema {
-            RootSchema::Struct(schema) => &schema.fields,
-            RootSchema::Enum {
-                variants,
-                tag_encoding,
-                ..
-            } => {
-                let disc = tag_encoding.parse_into_usize(reader.by_ref())?;
-
-                &variants
-                    .get(disc)
-                    .ok_or_else(|| invalid_tag_encoding(disc))?
-                    .fields
-            }
-        };
+        let fields = &self.read_schema(reader.by_ref())?.fields;
 
         Ok(fields.iter().map(move |field| {
             let value = field.parse(reader.by_ref())?;
@@ -372,6 +425,21 @@ impl Decoder {
                 value,
             })
         }))
+    }
+
+    #[inline]
+    fn read_schema<'de>(&self, reader: impl Reader<'de>) -> ReadResult<&Schema> {
+        match &self.schema {
+            RootSchema::Struct(schema) => Ok(schema),
+            RootSchema::Enum {
+                variants,
+                tag_encoding,
+                ..
+            } => {
+                let disc = tag_encoding.parse_into_usize(reader)?;
+                variants.get(disc).ok_or_else(|| invalid_tag_encoding(disc))
+            }
+        }
     }
 }
 
@@ -495,9 +563,17 @@ mod test {
     fn assert_enum_message(
         decoder: &Decoder,
         message: &EnumMessage,
+        variant: &str,
         expected: Vec<(&str, Ty, Option<usize>, Value<'_>)>,
     ) {
         let payload = wincode::serialize(message).unwrap();
+        assert_eq!(
+            decoder.decoded_name(payload.as_slice()).unwrap(),
+            DecodedName::Enum(EnumName {
+                enum_name: "EnumMessage",
+                variant_name: variant,
+            }),
+        );
         let actual = decoder
             .fields(payload.as_slice())
             .unwrap()
@@ -671,6 +747,12 @@ mod test {
 
         let schema = StructMessage::schema();
         let decoder = Decoder::new(schema);
+
+        // Resolving a struct's name does not require reading any input.
+        assert_eq!(
+            decoder.decoded_name(&[][..]).unwrap(),
+            DecodedName::Struct("StructMessage"),
+        );
 
         let payload = wincode::serialize(&message).unwrap();
         let result = decoder
@@ -989,9 +1071,23 @@ mod test {
         let decoder = Decoder::new(U8EnumMessage::schema());
 
         let ping = wincode::serialize(&U8EnumMessage::Ping).unwrap();
+        assert_eq!(
+            decoder.decoded_name(ping.as_slice()).unwrap(),
+            DecodedName::Enum(EnumName {
+                enum_name: "U8EnumMessage",
+                variant_name: "Ping",
+            }),
+        );
         assert_eq!(decoder.fields(ping.as_slice()).unwrap().count(), 0);
 
         let value = wincode::serialize(&U8EnumMessage::Value(42)).unwrap();
+        assert_eq!(
+            decoder.decoded_name(value.as_slice()).unwrap(),
+            DecodedName::Enum(EnumName {
+                enum_name: "U8EnumMessage",
+                variant_name: "Value",
+            }),
+        );
         let fields = decoder
             .fields(value.as_slice())
             .unwrap()
@@ -1011,10 +1107,11 @@ mod test {
     fn enum_roundtrips_every_variant_shape() {
         let decoder = Decoder::new(EnumMessage::schema());
 
-        assert_enum_message(&decoder, &EnumMessage::Ping, Vec::new());
+        assert_enum_message(&decoder, &EnumMessage::Ping, "Ping", Vec::new());
         assert_enum_message(
             &decoder,
             &EnumMessage::Coordinates(42, true),
+            "Coordinates",
             vec![
                 (
                     "0",
@@ -1036,6 +1133,7 @@ mod test {
                 text: "hello".into(),
                 bytes: vec![1, 2, 3, 4],
             },
+            "Payload",
             vec![
                 (
                     "text",
@@ -1067,6 +1165,10 @@ mod test {
             error,
             wincode::ReadError::InvalidTagEncoding(value) if value == u32::MAX as usize
         ));
+        assert!(matches!(
+            decoder.decoded_name(payload.as_slice()),
+            Err(wincode::ReadError::InvalidTagEncoding(value)) if value == u32::MAX as usize
+        ));
     }
 
     #[test]
@@ -1075,6 +1177,7 @@ mod test {
 
         let truncated_discriminant = [0u8; 3];
         assert!(decoder.fields(&truncated_discriminant[..]).is_err());
+        assert!(decoder.decoded_name(&truncated_discriminant[..]).is_err());
 
         let mut truncated = wincode::serialize(&EnumMessage::Coordinates(42, true)).unwrap();
         truncated.pop();
